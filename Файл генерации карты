@@ -1,0 +1,384 @@
+import pygame
+import math
+import random
+
+# --- Константы ---
+GRID_WIDTH = 10
+GRID_HEIGHT = 15
+CELL_SIZE = 40
+MARGIN = 5
+
+BLACK = (0, 0, 0)
+WHITE = (255, 255, 255)
+GREEN = (0, 255, 0)
+GRAY = (128, 128, 128)
+OBSTACLE_COLOR = (105, 105, 105)
+DARK_GRAY = (100, 100, 100)
+LIGHT_GRAY = (200, 200, 200)
+CIRCLE_COLOR = WHITE
+TEXT_COLOR = BLACK
+GRID_LETTER_COLOR = BLACK
+BUTTON_COLOR = (0, 100, 200)
+BUTTON_TEXT_COLOR = WHITE
+
+# Размеры окна (оставим место для кнопки внизу)
+BUTTON_HEIGHT = 40
+BUTTON_PADDING = 10
+GRID_AREA_HEIGHT = GRID_HEIGHT * (CELL_SIZE + MARGIN) + MARGIN
+WINDOW_WIDTH = GRID_WIDTH * (CELL_SIZE + MARGIN) + MARGIN
+WINDOW_HEIGHT = GRID_AREA_HEIGHT + BUTTON_HEIGHT + BUTTON_PADDING * 2 # Добавляем высоту кнопки и отступы
+WINDOW_SIZE = [WINDOW_WIDTH, WINDOW_HEIGHT]
+
+# --- Параметры попапов и юнитов (без изменений) ---
+POPUP_WIDTH = 150
+POPUP_HEIGHT = 100
+POPUP_PADDING = 10
+CIRCLE_RADIUS = 15
+NUM_CIRCLES_ROW = 3
+NUM_CIRCLES_COL = 2
+NUM_CIRCLES = NUM_CIRCLES_ROW * NUM_CIRCLES_COL
+
+UNIT_DATA = {
+    1: {"label": "скваер", "abbr": "Ск"},
+    2: {"label": "рыцарь", "abbr": "Рц"},
+    3: {"label": "мастер клинка", "abbr": "МК"},
+    4: {"label": "паладин веры", "abbr": "ПВ"},
+    5: {"label": "ангел", "abbr": "Ан"}
+}
+MENU_ORDER_KEYS = list(UNIT_DATA.keys()) # Ключи юнитов для случайного выбора
+
+NUM_MENU_WIDTH = 130
+NUM_MENU_ITEM_HEIGHT = 25
+NUM_MENU_PADDING = 4
+NUM_MENU_HEIGHT = len(MENU_ORDER_KEYS) * NUM_MENU_ITEM_HEIGHT + 2 * NUM_MENU_PADDING
+
+# --- Инициализация Pygame ---
+pygame.init()
+pygame.font.init()
+screen = pygame.display.set_mode(WINDOW_SIZE)
+pygame.display.set_caption("Генерация карты с юнитами")
+
+# --- Шрифты ---
+try:
+    ABBR_FONT = pygame.font.SysFont(None, 20)
+    MENU_FONT = pygame.font.SysFont(None, 18)
+    GRID_LETTER_FONT = pygame.font.SysFont(None, 35)
+    BUTTON_FONT = pygame.font.SysFont(None, 24) # Шрифт для кнопки
+except Exception as e:
+    print(f"Не удалось загрузить системный шрифт: {e}. Используется шрифт по умолчанию.")
+    ABBR_FONT = pygame.font.Font(None, 20)
+    MENU_FONT = pygame.font.Font(None, 18)
+    GRID_LETTER_FONT = pygame.font.Font(None, 35)
+    BUTTON_FONT = pygame.font.Font(None, 24)
+
+# --- Глобальные переменные для данных карты ---
+# Инициализируем пустыми, т.к. generate_new_map заполнит их
+grid_data = []
+obstacle_map = []
+
+# --- Функция генерации новой карты ---
+def generate_new_map():
+    global grid_data, obstacle_map # Указываем, что меняем глобальные переменные
+
+    print("\n--- Генерация новой карты ---")
+    # 1. Очистка данных
+    grid_data = [[[0 for _ in range(NUM_CIRCLES)] for _ in range(GRID_WIDTH)] for _ in range(GRID_HEIGHT)]
+    obstacle_map = [[False for _ in range(GRID_WIDTH)] for _ in range(GRID_HEIGHT)]
+
+    total_cells = GRID_WIDTH * GRID_HEIGHT
+    all_coords = [(r, c) for r in range(GRID_HEIGHT) for c in range(GRID_WIDTH)]
+
+    # 2. Генерация препятствий (ровно 15%)
+    num_obstacles = math.floor(total_cells * 0.15) # Используем floor для точных 15%
+    obstacle_coords_set = set(random.sample(all_coords, num_obstacles)) # Используем set для быстрого поиска
+    for r, c in obstacle_coords_set:
+        obstacle_map[r][c] = True
+    print(f"Сгенерировано препятствий: {num_obstacles} (15%)")
+
+    # 3. Генерация юнитов (25% от НЕ-препятствий)
+    available_coords = [coord for coord in all_coords if coord not in obstacle_coords_set]
+    num_unit_cells = math.floor(len(available_coords) * 0.25)
+    unit_cell_coords = random.sample(available_coords, num_unit_cells)
+    print(f"Клеток для юнитов: {num_unit_cells} (25% от {len(available_coords)} доступных)")
+
+    generated_unit_count = 0
+    for r, c in unit_cell_coords:
+        # Количество юнитов в этой клетке (1-6)
+        num_units_in_cell = random.randint(1, NUM_CIRCLES)
+        # Индексы ячеек для заполнения
+        circle_indices_to_fill = random.sample(range(NUM_CIRCLES), num_units_in_cell)
+
+        for circle_idx in circle_indices_to_fill:
+            # Случайный тип юнита
+            random_unit_key = random.choice(MENU_ORDER_KEYS)
+            grid_data[r][c][circle_idx] = random_unit_key
+            generated_unit_count +=1
+
+    print(f"Всего размещено юнитов: {generated_unit_count}")
+    print("--------------------------")
+
+# --- Начальная генерация карты ---
+generate_new_map()
+
+# --- Rect для кнопки ---
+button_width = 200
+button_x = (WINDOW_WIDTH - button_width) // 2
+button_y = GRID_AREA_HEIGHT + BUTTON_PADDING
+generate_button_rect = pygame.Rect(button_x, button_y, button_width, BUTTON_HEIGHT)
+
+# --- Переменные состояния (без изменений) ---
+popup_visible = False
+popup_rect = None
+active_grid_cell = None
+circle_positions_abs = []
+
+num_menu_visible = False
+num_menu_rect = None
+num_menu_items_rects = []
+active_circle_index = -1
+
+preview_visible = False
+preview_cell_coords = None
+preview_popup_rect = None
+preview_circle_positions_abs = []
+
+# --- Вспомогательная функция для геометрии попапа (без изменений) ---
+def calculate_popup_geometry(cell_coords_tuple, base_window_width, base_window_height):
+    row, col = cell_coords_tuple
+    cell_left = MARGIN + col * (CELL_SIZE + MARGIN)
+    cell_top = MARGIN + row * (CELL_SIZE + MARGIN)
+    cell_rect = pygame.Rect(cell_left, cell_top, CELL_SIZE, CELL_SIZE)
+
+    p_x = cell_rect.centerx - POPUP_WIDTH // 2
+    p_y = cell_rect.centery - POPUP_HEIGHT // 2
+    # Используем GRID_AREA_HEIGHT для ограничения, чтобы попап не залез на кнопку
+    p_x = max(0, min(base_window_width - POPUP_WIDTH, p_x))
+    p_y = max(0, min(GRID_AREA_HEIGHT - POPUP_HEIGHT, p_y)) # Ограничиваем сверху и снизу зоной грида
+    calculated_popup_rect = pygame.Rect(p_x, p_y, POPUP_WIDTH, POPUP_HEIGHT)
+
+    calculated_circle_positions = []
+    spacing_x = (POPUP_WIDTH - 2 * POPUP_PADDING) // (NUM_CIRCLES_ROW + 1)
+    spacing_y = (POPUP_HEIGHT - 2 * POPUP_PADDING) // (NUM_CIRCLES_COL + 1)
+    for i in range(NUM_CIRCLES_COL):
+        for j in range(NUM_CIRCLES_ROW):
+            rel_x = POPUP_PADDING + spacing_x * (j + 1)
+            rel_y = POPUP_PADDING + spacing_y * (i + 1)
+            abs_x = calculated_popup_rect.left + rel_x
+            abs_y = calculated_popup_rect.top + rel_y
+            calculated_circle_positions.append((abs_x, abs_y))
+    return calculated_popup_rect, calculated_circle_positions
+
+# --- Основной цикл ---
+running = True
+clock = pygame.time.Clock()
+right_mouse_button_held = False
+
+while running:
+    mouse_pos = pygame.mouse.get_pos()
+
+    # --- Обработка событий ---
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            running = False
+
+        elif event.type == pygame.MOUSEBUTTONDOWN:
+            # --- Клик по кнопке генерации ---
+            if generate_button_rect.collidepoint(mouse_pos):
+                if event.button == 1: # Только ЛКМ
+                    generate_new_map()
+                    # Сбрасываем все активные окна при генерации
+                    popup_visible = False
+                    num_menu_visible = False
+                    preview_visible = False
+                    active_grid_cell = None
+                    active_circle_index = -1
+                    preview_cell_coords = None
+            # --- Остальная логика кликов (ЛКМ и ПКМ по гриду/попапам) ---
+            else:
+                # --- Левая кнопка мыши (ЛКМ) ---
+                if event.button == 1:
+                    preview_visible = False; preview_cell_coords = None; right_mouse_button_held = False
+                    clicked_on_num_menu_item = False; clicked_on_circle = False; clicked_on_grid_cell = False
+                    click_inside_main_popup = False; click_inside_num_menu_bg = False
+
+                    # 1. Клик по меню выбора
+                    if num_menu_visible and num_menu_rect.collidepoint(mouse_pos):
+                        click_inside_num_menu_bg = True
+                        for i, item_rect in enumerate(num_menu_items_rects):
+                            if item_rect.collidepoint(mouse_pos):
+                                selected_unit_key = MENU_ORDER_KEYS[i]
+                                if active_grid_cell and active_circle_index != -1:
+                                    row, col = active_grid_cell
+                                    if not obstacle_map[row][col]:
+                                        grid_data[row][col][active_circle_index] = selected_unit_key
+                                        print(f"Ячейка [{row}][{col}], круг {active_circle_index} = {UNIT_DATA[selected_unit_key]['label']}")
+                                num_menu_visible = False; active_circle_index = -1; clicked_on_num_menu_item = True; break
+                    # 2. Клик по кругам основного попапа
+                    elif popup_visible and popup_rect.collidepoint(mouse_pos):
+                        click_inside_main_popup = True
+                        for i, circle_center in enumerate(circle_positions_abs):
+                            distance_sq = (mouse_pos[0] - circle_center[0])**2 + (mouse_pos[1] - circle_center[1])**2
+                            if distance_sq <= CIRCLE_RADIUS**2:
+                                clicked_on_circle = True
+                                if num_menu_visible and active_circle_index == i: num_menu_visible = False; active_circle_index = -1
+                                else:
+                                    active_circle_index = i; num_menu_visible = True
+                                    menu_x = circle_center[0] + CIRCLE_RADIUS + MARGIN; menu_y = circle_center[1] - NUM_MENU_HEIGHT // 2
+                                    menu_x = max(0, min(WINDOW_WIDTH - NUM_MENU_WIDTH, menu_x)); menu_y = max(0, min(GRID_AREA_HEIGHT - NUM_MENU_HEIGHT, menu_y)) # Ограничиваем меню зоной грида
+                                    if menu_x < circle_center[0] + CIRCLE_RADIUS - MARGIN:
+                                        menu_x_alt = circle_center[0] - CIRCLE_RADIUS - MARGIN - NUM_MENU_WIDTH
+                                        if menu_x_alt >= 0: menu_x = menu_x_alt
+                                    num_menu_rect = pygame.Rect(menu_x, menu_y, NUM_MENU_WIDTH, NUM_MENU_HEIGHT)
+                                    num_menu_items_rects = []
+                                    item_y = menu_y + NUM_MENU_PADDING
+                                    for _ in MENU_ORDER_KEYS:
+                                        item_rect = pygame.Rect(menu_x + NUM_MENU_PADDING, item_y, NUM_MENU_WIDTH - 2 * NUM_MENU_PADDING, NUM_MENU_ITEM_HEIGHT)
+                                        num_menu_items_rects.append(item_rect); item_y += NUM_MENU_ITEM_HEIGHT
+                                break
+                        if not clicked_on_circle and num_menu_visible: num_menu_visible = False; active_circle_index = -1
+                    # 3. Клик по гриду
+                    elif not popup_visible and not num_menu_visible:
+                        col_clicked = (mouse_pos[0] - MARGIN) // (CELL_SIZE + MARGIN); row_clicked = (mouse_pos[1] - MARGIN) // (CELL_SIZE + MARGIN)
+                        if 0 <= row_clicked < GRID_HEIGHT and 0 <= col_clicked < GRID_WIDTH:
+                            if not obstacle_map[row_clicked][col_clicked]:
+                                cell_left = MARGIN + col_clicked * (CELL_SIZE + MARGIN); cell_top = MARGIN + row_clicked * (CELL_SIZE + MARGIN)
+                                cell_rect = pygame.Rect(cell_left, cell_top, CELL_SIZE, CELL_SIZE)
+                                if cell_rect.collidepoint(mouse_pos):
+                                    clicked_on_grid_cell = True; popup_visible = True; active_grid_cell = (row_clicked, col_clicked)
+                                    num_menu_visible = False; active_circle_index = -1
+                                    popup_rect, circle_positions_abs = calculate_popup_geometry(active_grid_cell, WINDOW_WIDTH, GRID_AREA_HEIGHT) # Передаем высоту грида
+                            else: print(f"Клик ЛКМ по препятствию: [{row_clicked}][{col_clicked}]")
+                    # 4. Закрытие окон
+                    if not clicked_on_num_menu_item and not clicked_on_circle and not clicked_on_grid_cell and not click_inside_main_popup and not click_inside_num_menu_bg:
+                        if popup_visible or num_menu_visible:
+                            popup_visible = False; num_menu_visible = False; active_grid_cell = None; active_circle_index = -1
+
+                # --- Правая кнопка мыши (ПКМ) - НАЖАТИЕ ---
+                elif event.button == 3:
+                    right_mouse_button_held = True
+                    if popup_visible or num_menu_visible: popup_visible = False; num_menu_visible = False; active_grid_cell = None; active_circle_index = -1
+                    col_hovered = (mouse_pos[0] - MARGIN) // (CELL_SIZE + MARGIN); row_hovered = (mouse_pos[1] - MARGIN) // (CELL_SIZE + MARGIN)
+                    if 0 <= row_hovered < GRID_HEIGHT and 0 <= col_hovered < GRID_WIDTH:
+                        if not obstacle_map[row_hovered][col_hovered]:
+                            cell_left = MARGIN + col_hovered * (CELL_SIZE + MARGIN); cell_top = MARGIN + row_hovered * (CELL_SIZE + MARGIN)
+                            cell_rect = pygame.Rect(cell_left, cell_top, CELL_SIZE, CELL_SIZE)
+                            if cell_rect.collidepoint(mouse_pos):
+                                cell_data = grid_data[row_hovered][col_hovered]; has_units = any(uk > 0 for uk in cell_data)
+                                if has_units:
+                                    preview_visible = True; preview_cell_coords = (row_hovered, col_hovered)
+                                    preview_popup_rect, preview_circle_positions_abs = calculate_popup_geometry(preview_cell_coords, WINDOW_WIDTH, GRID_AREA_HEIGHT) # Передаем высоту грида
+                                else: preview_visible = False; preview_cell_coords = None
+                            else: preview_visible = False; preview_cell_coords = None
+                        else: preview_visible = False; preview_cell_coords = None; print(f"ПКМ над препятствием [{row_hovered}][{col_hovered}]")
+                    else: preview_visible = False; preview_cell_coords = None
+
+        # --- Отпускание кнопки мыши ---
+        elif event.type == pygame.MOUSEBUTTONUP:
+            if event.button == 3: # Отпускание ПКМ
+                right_mouse_button_held = False
+                if preview_visible: preview_visible = False; preview_cell_coords = None; preview_popup_rect = None; preview_circle_positions_abs = []
+
+        # --- Движение мыши (для обновления предпросмотра при удержании ПКМ) ---
+        elif event.type == pygame.MOUSEMOTION:
+            if right_mouse_button_held:
+                col_hovered = (mouse_pos[0] - MARGIN) // (CELL_SIZE + MARGIN); row_hovered = (mouse_pos[1] - MARGIN) // (CELL_SIZE + MARGIN)
+                new_hover_coords = None
+                if 0 <= row_hovered < GRID_HEIGHT and 0 <= col_hovered < GRID_WIDTH:
+                     if not obstacle_map[row_hovered][col_hovered]:
+                         cell_left = MARGIN + col_hovered * (CELL_SIZE + MARGIN); cell_top = MARGIN + row_hovered * (CELL_SIZE + MARGIN)
+                         cell_rect = pygame.Rect(cell_left, cell_top, CELL_SIZE, CELL_SIZE)
+                         if cell_rect.collidepoint(mouse_pos):
+                             cell_data = grid_data[row_hovered][col_hovered]; has_units = any(uk > 0 for uk in cell_data)
+                             if has_units: new_hover_coords = (row_hovered, col_hovered)
+                if new_hover_coords != preview_cell_coords:
+                    if new_hover_coords:
+                         preview_visible = True; preview_cell_coords = new_hover_coords
+                         preview_popup_rect, preview_circle_positions_abs = calculate_popup_geometry(preview_cell_coords, WINDOW_WIDTH, GRID_AREA_HEIGHT) # Передаем высоту грида
+                    else:
+                         if preview_visible: preview_visible = False; preview_cell_coords = None; preview_popup_rect = None; preview_circle_positions_abs = []
+
+
+    # --- Отрисовка ---
+    screen.fill(BLACK)
+
+    # Отрисовываем грид
+    for r in range(GRID_HEIGHT):
+        for c in range(GRID_WIDTH):
+            color = OBSTACLE_COLOR if obstacle_map[r][c] else GREEN
+            x = MARGIN + c * (CELL_SIZE + MARGIN); y = MARGIN + r * (CELL_SIZE + MARGIN)
+            cell_rect = pygame.draw.rect(screen, color, [x, y, CELL_SIZE, CELL_SIZE])
+            if not obstacle_map[r][c]:
+                cell_data = grid_data[r][c]; has_units = any(uk > 0 for uk in cell_data)
+                if has_units:
+                    try:
+                        letter_surf = GRID_LETTER_FONT.render("Ю", True, GRID_LETTER_COLOR)
+                        letter_rect = letter_surf.get_rect(center=cell_rect.center)
+                        screen.blit(letter_surf, letter_rect)
+                    except Exception as e: pass
+
+    # Отрисовка кнопки генерации
+    pygame.draw.rect(screen, BUTTON_COLOR, generate_button_rect, border_radius=5)
+    try:
+        btn_text_surf = BUTTON_FONT.render("Сгенерировать Карту", True, BUTTON_TEXT_COLOR)
+        btn_text_rect = btn_text_surf.get_rect(center=generate_button_rect.center)
+        screen.blit(btn_text_surf, btn_text_rect)
+    except Exception as e: pass
+
+    # Отрисовка предпросмотра (ПКМ)
+    if preview_visible and preview_popup_rect and preview_cell_coords:
+        pygame.draw.rect(screen, GRAY, preview_popup_rect)
+        pygame.draw.rect(screen, WHITE, preview_popup_rect, 1)
+        row, col = preview_cell_coords; current_cell_data = grid_data[row][col]
+        if len(preview_circle_positions_abs) == NUM_CIRCLES:
+            for i, center_pos in enumerate(preview_circle_positions_abs):
+                pygame.draw.circle(screen, CIRCLE_COLOR, center_pos, CIRCLE_RADIUS)
+                pygame.draw.circle(screen, BLACK, center_pos, CIRCLE_RADIUS, 1)
+                unit_key = current_cell_data[i]
+                if unit_key in UNIT_DATA:
+                    unit_abbr = UNIT_DATA[unit_key]["abbr"]
+                    try:
+                        text_surface = ABBR_FONT.render(unit_abbr, True, TEXT_COLOR)
+                        text_rect = text_surface.get_rect(center=center_pos)
+                        screen.blit(text_surface, text_rect)
+                    except Exception as e: pass
+
+    # Отрисовка основного всплывающего окна (ЛКМ)
+    if popup_visible and popup_rect and active_grid_cell:
+        pygame.draw.rect(screen, GRAY, popup_rect)
+        pygame.draw.rect(screen, WHITE, popup_rect, 1)
+        row, col = active_grid_cell; current_cell_data = grid_data[row][col]
+        if len(circle_positions_abs) == NUM_CIRCLES:
+             for i, center_pos in enumerate(circle_positions_abs):
+                 pygame.draw.circle(screen, CIRCLE_COLOR, center_pos, CIRCLE_RADIUS)
+                 pygame.draw.circle(screen, BLACK, center_pos, CIRCLE_RADIUS, 1)
+                 unit_key = current_cell_data[i]
+                 if unit_key in UNIT_DATA:
+                     unit_abbr = UNIT_DATA[unit_key]["abbr"]
+                     try:
+                         text_surface = ABBR_FONT.render(unit_abbr, True, TEXT_COLOR)
+                         text_rect = text_surface.get_rect(center=center_pos)
+                         screen.blit(text_surface, text_rect)
+                     except Exception as e: pass
+
+    # Отрисовка меню выбора юнита
+    if num_menu_visible and num_menu_rect:
+        pygame.draw.rect(screen, DARK_GRAY, num_menu_rect, border_radius=3)
+        pygame.draw.rect(screen, WHITE, num_menu_rect, 1, border_radius=3)
+        for i, item_rect in enumerate(num_menu_items_rects):
+            unit_key = MENU_ORDER_KEYS[i]; unit_label = UNIT_DATA[unit_key]["label"]
+            bgcolor = LIGHT_GRAY if item_rect.collidepoint(mouse_pos) else DARK_GRAY
+            pygame.draw.rect(screen, bgcolor, item_rect, border_radius=2)
+            pygame.draw.rect(screen, WHITE, item_rect, 1, border_radius=2)
+            try:
+                 unit_text = MENU_FONT.render(unit_label, True, TEXT_COLOR)
+                 unit_text_rect = unit_text.get_rect(center=item_rect.center)
+                 screen.blit(unit_text, unit_text_rect)
+            except Exception as e: pass
+
+    # --- Обновление экрана ---
+    pygame.display.flip()
+    clock.tick(60)
+
+# --- Завершение ---
+pygame.font.quit()
+pygame.quit()
