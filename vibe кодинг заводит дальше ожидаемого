@@ -1,0 +1,319 @@
+# pip install gymnasium stable-baselines3 numpy wandb
+
+import numpy as np
+import gymnasium as gym
+from gymnasium import spaces
+import random
+from operator import itemgetter
+
+# ============================================================
+#                      ИСХОДНЫЕ ДАННЫЕ
+# ============================================================
+UNITS_RED = [
+    {"имя": "рыцарь1",  "инициатива": 67, "инициатива_база": 67, "team": "red",  "position": 1, "stand": "ahead",  "Type": "Archer", "Урон": 20, "Здоровье": 60},
+    {"имя": "рыцарь2",  "инициатива": 33, "инициатива_база": 33, "team": "red",  "position": 2, "stand": "ahead",  "Type": "Archer", "Урон": 20, "Здоровье": 60},
+    {"имя": "рыцарь3",  "инициатива": 78, "инициатива_база": 78, "team": "red",  "position": 3, "stand": "ahead",  "Type": "Archer", "Урон": 20, "Здоровье": 60},
+    {"имя": "рыцарь7",  "инициатива": 45, "инициатива_база": 45, "team": "red",  "position": 4, "stand": "behind", "Type": "Archer", "Урон": 20, "Здоровье": 60},
+    {"имя": "рыцарь8",  "инициатива": 90, "инициатива_база": 90, "team": "red",  "position": 5, "stand": "behind", "Type": "Archer", "Урон": 20, "Здоровье": 60},
+    {"имя": "рыцарь9",  "инициатива": 12, "инициатива_база": 12, "team": "red",  "position": 6, "stand": "behind", "Type": "Archer", "Урон": 20, "Здоровье": 60},
+]
+UNITS_BLUE = [
+    {"имя": "рыцарь4",  "инициатива": 88, "инициатиива_база": 88, "team": "blue", "position": 7,  "stand": "ahead",  "Type": "Archer", "Урон": 20, "Здоровье": 60},  # возможная опечатка
+    {"имя": "рыцарь5",  "инициатива": 55, "инициатива_база": 55, "team": "blue", "position": 8,  "stand": "ahead",  "Type": "Archer", "Урон": 20, "Здоровье": 60},
+    {"имя": "рыцарь6",  "инициатива": 22, "инициатива_база": 22, "team": "blue", "position": 9,  "stand": "ahead",  "Type": "Archer", "Урон": 20, "Здоровье": 60},
+    {"имя": "рыцарь10", "инициатива": 60, "инициатива_база": 60, "team": "blue", "position": 10, "stand": "behind", "Type": "Archer", "Урон": 20, "Здоровье": 60},
+    {"имя": "рыцарь11", "инициатива": 47, "инициатива_база": 47, "team": "blue", "position": 11, "stand": "behind", "Type": "Archer", "Урон": 20, "Здоровье": 60},
+    {"имя": "рыцарь12", "инициатива": 75, "инициатива_база": 75, "team": "blue", "position": 12, "stand": "behind", "Type": "Archer", "Урон": 20, "Здоровье": 60},
+]
+# Подчистим возможную опечатку ключа у синего 4:
+for u in UNITS_BLUE:
+    if "инициатива_база" not in u and "инициатиива_база" in u:
+        u["инициатива_база"] = u.pop("инициатиива_база")
+
+BLUE_POSITIONS = list(range(7, 13))
+RED_POSITIONS  = list(range(1, 7))
+MAX_HP = 60
+MAX_INIT = max([u["инициатива_база"] for u in (UNITS_RED + UNITS_BLUE)])
+
+
+# ============================================================
+#                      ОПРЕДЕЛЕНИЕ СРЕДЫ
+# ============================================================
+
+class BattleEnv(gym.Env):
+    """
+    Наблюдение: вектор (24,) = [HP1, INI1, ..., HP12, INI12]
+    Действие: Discrete(6) — выбор цели среди позиций RED 1..6
+    Красные: бьют СЛУЧАЙНУЮ живую синюю цель.
+    Синие: агент выбирает цель (удар в «мертвую» — холостой).
+    Награда: +1 победа BLUE, -1 победа RED, 0 — промежуточно.
+    """
+
+    metadata = {"render_modes": []}
+
+    def __init__(self, reward_win: float = 1.0, reward_loss: float = -1.0, reward_step: float = 0.0,
+                 log_enabled: bool = False):
+        super().__init__()
+        self.reward_win = float(reward_win)
+        self.reward_loss = float(reward_loss)
+        self.reward_step = float(reward_step)
+        self.log_enabled = bool(log_enabled)
+
+        self.action_space = spaces.Discrete(6)
+        low  = np.zeros(24, dtype=np.float32)
+        high = np.array(sum([[MAX_HP, MAX_INIT] for _ in range(12)], []), dtype=np.float32)
+        self.observation_space = spaces.Box(low=low, high=high, dtype=np.float32)
+
+        self.rng = random.Random()
+        self.combined = None
+        self.round_no = None
+        self.winner = None
+        self.current_blue_attacker_pos = None
+
+        self._pretty_events = []  # человекочитаемые логи (для теста)
+
+    # --------- утилиты ---------
+    def seed(self, seed=None):
+        self.rng = random.Random(seed)
+
+    def _alive(self, u): return u["Здоровье"] > 0
+    def _team_alive(self, team): return any(self._alive(u) and u["team"] == team for u in self.combined)
+    def _unit_by_position(self, pos): return next((u for u in self.combined if u["position"] == pos), None)
+    def _live_positions_of(self, team): return [u["position"] for u in self.combined if u["team"] == team and self._alive(u)]
+
+    def _log(self, s: str):
+        if self.log_enabled: self._pretty_events.append(s)
+
+    def pop_pretty_events(self):
+        out = self._pretty_events[:]
+        self._pretty_events.clear()
+        return out
+
+    def _reset_state(self):
+        self.combined = [u.copy() for u in (UNITS_RED + UNITS_BLUE)]
+        for u in self.combined:
+            u["инициатива"] = u["инициатива_база"]
+        self.round_no = 1
+        self.winner = None
+        self.current_blue_attacker_pos = None
+        self._log(f"Эпизод начат. Раунд {self.round_no}.")
+
+    def _candidates(self):
+        return [u for u in self.combined if self._alive(u) and u["инициатива"] > 0]
+
+    def _pop_next(self):
+        cand = self._candidates()
+        if not cand:
+            return None
+        self.rng.shuffle(cand)
+        cand.sort(key=itemgetter("инициатива"), reverse=True)
+        return cand[0]
+
+    def _end_round_restore(self):
+        for u in self.combined:
+            u["инициатива"] = u["инициатива_база"] if self._alive(u) else 0
+        self._log("Восстановление инициативы. Новый раунд.")
+
+    def _attack(self, attacker, target_pos):
+        victim = self._unit_by_position(target_pos) if target_pos is not None else None
+        if victim is not None and self._alive(victim):
+            before = victim["Здоровье"]
+            victim["Здоровье"] -= attacker["Урон"]
+            after = victim["Здоровье"]
+            self._log(f"{attacker['team'].upper()} {attacker['имя']}#{attacker['position']} → "
+                      f"{victim['team'].upper()} {victim['имя']}#{victim['position']}: {attacker['Урон']} "
+                      f"({before}→{max(0, after)})")
+            if victim["Здоровье"] <= 0:
+                victim["инициатива"] = 0
+                self._log(f"✖ {victim['team'].upper()} {victim['имя']}#{victim['position']} выведен из строя.")
+        else:
+            self._log(f"{attacker['team'].upper()} {attacker['имя']}#{attacker['position']} бьёт pos{target_pos}: цели нет/мертва.")
+
+    def _check_victory_after_hit(self):
+        if not self._team_alive("blue"):
+            self.winner = "red";  self._log("🏆 Победа RED!")
+        elif not self._team_alive("red"):
+            self.winner = "blue"; self._log("🏆 Победа BLUE!")
+
+    def _advance_until_blue_turn(self):
+        while self._team_alive("red") and self._team_alive("blue"):
+            nxt = self._pop_next()
+            if nxt is None:
+                self._log(f"— Конец раунда {self.round_no}.")
+                self._end_round_restore()
+                self.round_no += 1
+                self._log(f"— Начало раунда {self.round_no}.")
+                continue
+
+            if nxt["team"] == "blue":
+                self.current_blue_attacker_pos = nxt["position"]
+                self._log(f"Ход BLUE: {nxt['имя']}#{nxt['position']} (иниц {nxt['инициатива']}). Ожидание действия.")
+                return True
+
+            # Красный ходит: случайная живая синяя цель
+            nxt["инициатива"] = 0
+            live_blue_positions = self._live_positions_of("blue")
+            target_pos = self.rng.choice(live_blue_positions) if live_blue_positions else None
+            self._log(f"RED ход: {nxt['имя']}#{nxt['position']} → случайная цель pos{target_pos}.")
+            self._attack(nxt, target_pos)
+            self._check_victory_after_hit()
+            if self.winner is not None:
+                return False
+        return False
+
+    def _obs(self):
+        vec = []
+        for pos in RED_POSITIONS + BLUE_POSITIONS:
+            u = self._unit_by_position(pos)
+            vec.extend([float(max(0, u["Здоровье"])), float(max(0, u["инициатива"]))])
+        return np.array(vec, dtype=np.float32)
+
+    # ----------------- API Gymnasium -----------------
+    def reset(self, *, seed=None, options=None):
+        if seed is not None:
+            self.seed(seed)
+        self._reset_state()
+        self._advance_until_blue_turn()
+        return self._obs(), {}
+
+    def step(self, action):
+        assert self.winner is None, "Эпизод завершён — вызовите reset()."
+        if self.current_blue_attacker_pos is None:
+            self._advance_until_blue_turn()
+            if self.winner is not None:
+                return self._obs(), (self.reward_win if self.winner == "blue" else self.reward_loss), True, False, {}
+
+        # BLUE (агент) атакует выбранную RED-позицию
+        target_pos = RED_POSITIONS[int(action)]
+        attacker = self._unit_by_position(self.current_blue_attacker_pos)
+        if attacker is not None and self._alive(attacker) and attacker["инициатива"] > 0:
+            self._log(f"BLUE действие: {attacker['имя']}#{attacker['position']} → pos{target_pos}")
+            attacker["инициатива"] = 0
+            self._attack(attacker, target_pos)
+            self._check_victory_after_hit()
+
+        if self.winner is None:
+            self.current_blue_attacker_pos = None
+            self._advance_until_blue_turn()
+
+        if self.winner is None:
+            reward, terminated = self.reward_step, False
+        else:
+            reward = self.reward_win if self.winner == "blue" else self.reward_loss
+            terminated = True
+
+        return self._obs(), reward, terminated, False, {}
+
+
+# ============================================================
+#                ОБУЧЕНИЕ PPO + W&B ЛОГИРОВАНИЕ
+# ============================================================
+if __name__ == "__main__":
+    from stable_baselines3 import PPO
+    from stable_baselines3.common.env_util import make_vec_env
+    from stable_baselines3.common.monitor import Monitor
+    from stable_baselines3.common.callbacks import CallbackList, EvalCallback
+    import wandb
+    from wandb.integration.sb3 import WandbCallback
+
+    # -------- Инициализация W&B --------
+    run = wandb.init(
+        project="red-blue-battle",      # ← поменяйте на ваш проект
+        name="ppo-50k",
+        config={
+            "algo": "PPO",
+            "total_timesteps": 50_000,
+            "n_envs": 8,
+            "n_steps": 1024,
+            "batch_size": 2048,
+            "gamma": 0.99,
+            "gae_lambda": 0.95,
+            "learning_rate": 3e-4,
+            "clip_range": 0.2,
+        },
+        sync_tensorboard=True,          # ← синхронизация TB → Weights & Biases
+        save_code=True,
+    )
+
+    # Обёртка-фабрика среды: без логов для скорости
+    def make_env():
+        # Monitor нужен, чтобы SB3 писал эпизодические метрики (ep_rew_mean)
+        return Monitor(BattleEnv(reward_win=1.0, reward_loss=-1.0, reward_step=0.0, log_enabled=False))
+
+    # Векторизированные среды + Monitor
+    vec_env = make_vec_env(make_env, n_envs=8, seed=42, monitor_dir="./monitor")
+
+    # Отдельная eval-среда для периодической оценки (метрики уйдут в TB → W&B)
+    eval_env = Monitor(BattleEnv(log_enabled=False))
+
+    model = PPO(
+        policy="MlpPolicy",
+        env=vec_env,
+        verbose=1,                    # это лог SB3
+        n_steps=1024,
+        batch_size=2048,
+        gae_lambda=0.95,
+        gamma=0.99,
+        n_epochs=10,
+        learning_rate=3e-4,
+        clip_range=0.2,
+        ent_coef=0.0,
+        vf_coef=0.5,
+        seed=42,
+        tensorboard_log=f"./tb_logs/{run.id}",  # ← чтобы TB-скаляры синхронизировались в W&B
+    )
+
+    # W&B callback + периодическая оценка
+    wandb_cb = WandbCallback(
+        gradient_save_freq=1000,                   # можно уменьшить/увеличить
+        model_save_path=f"./models/{run.id}",      # куда сохранять чекпоинты
+        model_save_freq=10_000,                    # частота сохранения модели
+        verbose=2,
+    )
+    eval_cb = EvalCallback(
+        eval_env,
+        best_model_save_path=f"./models/{run.id}/best",
+        log_path=f"./eval/{run.id}",
+        eval_freq=1000,                # каждые 10k шагов —  оценка
+        n_eval_episodes=5,
+        deterministic=True,
+        render=False,
+    )
+    callbacks = CallbackList([wandb_cb, eval_cb])
+
+    # -------- Обучение с трекингом в W&B --------
+    model.learn(total_timesteps=500000, callback=callbacks)
+
+    # Сохранение финальной модели
+    model.save("ppo_blue_vs_red")
+    run.finish()  # завершить W&B-запуск
+
+    # =======================================================
+    #   ТЕСТОВЫЙ ПРОГОН С ЧИТАЕМЫМИ ЛОГАМИ (1 эпизод)
+    # =======================================================
+    print("\n=== ТЕСТОВЫЙ ПРОГОН С ЛОГАМИ ===")
+    test_env = BattleEnv(log_enabled=True)   # включаем человекочитаемые логи только для теста
+    obs, info = test_env.reset(seed=123)
+
+    # печатаем логи автодокрутки до хода BLUE
+    for line in test_env.pop_pretty_events():
+        print(line)
+
+    done = False
+    total_reward = 0.0
+    step_i = 0
+    while not done:
+        step_i += 1
+        action, _ = model.predict(obs, deterministic=True)
+        target_pos = RED_POSITIONS[int(action)]
+        print(f"\n[STEP {step_i}] Агент выбирает action={int(action)} → атака RED pos{target_pos}")
+
+        obs, reward, terminated, truncated, info = test_env.step(action)
+        total_reward += reward
+        done = terminated or truncated
+
+        for line in test_env.pop_pretty_events():
+            print(line)
+
+    print("\n=== ЭПИЗОД ЗАВЕРШЁН ===")
+    print("Победитель:", test_env.winner.upper(), "| Суммарная награда:", total_reward)
