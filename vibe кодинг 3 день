@@ -1,0 +1,903 @@
+# ============================================================
+# БЛОК 1: КАСТОМНАЯ СРЕДА Gymnasium «RED vs BLUE»
+# ------------------------------------------------------------
+# Типы:
+#  • Archer — одиночная атака (урон 20, базовый HP 60)
+#  • Death  — одиночная атака (урон 20, базовый HP 60) + при ПЕРВОМ попадании накладывает яд:
+#             цель получает 10 урона в НАЧАЛЕ своего хода 3 раза
+#             + имеет иммунитет к типу атаки "Weapon" (см. свойство "иммунитет")
+#             + Тип атаки 2: "poison" (иммунитет к нему блокирует НАЛОЖЕНИЕ яда)
+#  • Mage   — массовая атака по всем живым врагам (урон 10, базовый HP 70)
+#  • Воин   — ближний бой со смежностью (урон 30, базовый HP 80)
+#  • Demon  — как Воин по досягаемости, но бьёт ДВАЖДЫ подряд в свой ход (урон 30, базовый HP 80)
+#  • lord   — как Воин по досягаемости (1 удар). Первая ЕГО успешная атака накладывает «поджог»:
+#             цель получает 10 урона в НАЧАЛЕ своего хода 3 раза. Тип атаки 2: "Fire"
+#
+# Свойства юнита (все, кроме имени, попадают в наблюдение агента):
+#  • "Здоровье" (HP), "инициатива", "инициатива_база", "Урон"
+#  • "team" (red/blue), "position" (1..12), "stand" (ahead/behind), "Type"
+#  • "иммунитет": list[str] — список иммунитетов к типам атаки ("Weapon","earth","Fire","poison"...)
+#  • "Тип атаки 1": str     — базовый тип атаки (иммунитет блокирует урон + эффекты)
+#  • "Тип атаки 2": str     — доп. тип для иммунитета к НАЛОЖЕНИЮ статуса (яд/поджог)
+#  • "poison_turns_left": int — оставшиеся тики яда
+#  • "burn_turns_left":   int — оставшиеся тики поджога
+#
+# ПРАВИЛО ИММУНИТЕТА:
+#  • Урон не проходит, если "Тип атаки 1" атакующего ∈ "иммунитет" цели (эффекты тоже не накладываются).
+#  • Даже если урон прошёл, НАЛОЖЕНИЕ статусов блокируется, если "Тип атаки 2" атакующего (если не пуст) ∈ "иммунитет" цели.
+# ------------------------------------------------------------
+# Примечание: ячейка не требует Stable-Baselines3 и Weights & Biases.
+# ============================================================
+
+# (Колаб) Мягко убедимся, что Gymnasium установлен.
+try:
+    import gymnasium as gym
+except Exception:
+    !pip -q install gymnasium
+    import gymnasium as gym
+
+import random
+from operator import itemgetter
+from typing import List, Dict, Optional
+
+import numpy as np
+from gymnasium import spaces
+
+# --- словари для кодирования в наблюдении ---
+TYPE_LIST = ["Archer", "Mage", "Воин", "Demon", "Death", "lord"]       # one-hot(6)
+ATTACK_TYPES = ["Weapon", "earth", "Fire", "poison"]                    # one-hot(4) для Тип атаки 1/2 и иммунитета
+
+def _one_hot(value: str, vocab: List[str]) -> List[float]:
+    return [1.0 if value == v else 0.0 for v in vocab]
+
+def _multi_hot(values: List[str], vocab: List[str]) -> List[float]:
+    s = set(values or [])
+    return [1.0 if v in s else 0.0 for v in vocab]
+
+# ------------------------ Исходные юниты ------------------------
+# Состав (возвращаем «полный» бой):
+#   Спереди: 2 воина + 1 демон; сзади: 1 Death + 2 лучника — у КАЖДОЙ стороны.
+#   Доп. изменения:
+#     • В BLUE один из воинов (не демон) переименован во «Владыка» и имеет Type="lord" (поджог при 1-й успешной атаке).
+#     • В BLUE заменили Death на лучника earth; ОДИН из earth-лучников BLUE имеет 1000 HP.
+#     • У обеих сторон по одному лучнику с Тип атаки 1 == "earth" (остальные — "Weapon").
+#     • У Death: иммунитет ["Weapon"], Тип атаки 2 == "poison".
+#     • У Владыки: Тип атаки 2 == "Fire".
+#
+# RED
+UNITS_RED = [
+    {"имя": "рыцарь1",  "инициатива": 67, "инициатива_база": 67, "team": "red",  "position": 1, "stand": "ahead",
+     "Type": "Воин", "Урон": 30, "Здоровье": 80, "иммунитет": [], "Тип атаки 1": "Weapon", "Тип атаки 2": ""},
+    {"имя": "рыцарь2",  "инициатива": 33, "инициатива_база": 33, "team": "red",  "position": 2, "stand": "ahead",
+     "Type": "Воин", "Урон": 30, "Здоровье": 80, "иммунитет": [], "Тип атаки 1": "Weapon", "Тип атаки 2": ""},
+    {"имя": "демон1",   "инициатива": 78, "инициатива_база": 78, "team": "red",  "position": 3, "stand": "ahead",
+     "Type": "Demon","Урон": 30, "Здоровье": 80, "иммунитет": [], "Тип атаки 1": "Weapon", "Тип атаки 2": ""},
+    {"имя": "Смерть1",  "инициатива": 45, "инициатива_база": 45, "team": "red",  "position": 4, "stand": "behind",
+     "Type": "Death","Урон": 20, "Здоровье": 20, "иммунитет": ["Weapon"], "Тип атаки 1": "Weapon", "Тип атаки 2": "poison"},
+    # Этот лучник — единственный с типом атаки earth у RED
+    {"имя": "Лучник",   "инициатива": 90, "инициатива_база": 90, "team": "red",  "position": 5, "stand": "behind",
+     "Type": "Archer","Урон": 20, "Здоровье": 60, "иммунитет": [], "Тип атаки 1": "earth",  "Тип атаки 2": ""},
+    {"имя": "Лучник2",  "инициатива": 12, "инициатива_база": 12, "team": "red",  "position": 6, "stand": "behind",
+     "Type": "Archer","Урон": 20, "Здоровье": 60, "иммунитет": [], "Тип атаки 1": "Weapon","Тип атаки 2": ""},
+]
+
+# BLUE
+UNITS_BLUE = [
+    {"имя": "демон2",   "инициатива": 88, "инициатива_база": 88, "team": "blue", "position": 7,  "stand": "ahead",
+     "Type": "Demon","Урон": 30, "Здоровье": 80,  "иммунитет": [], "Тип атаки 1": "Weapon", "Тип атаки 2": ""},
+    # Владыка (lord) — заменяет одного из воинов (не демона)
+    {"имя": "Владыка",  "инициатива": 55, "инициатива_база": 55, "team": "blue", "position": 8,  "stand": "ahead",
+     "Type": "lord", "Урон": 30, "Здоровье": 80,  "иммунитет": [], "Тип атаки 1": "Weapon", "Тип атаки 2": "Fire"},
+    {"имя": "рыцарь6",  "инициатива": 22, "инициатива_база": 22, "team": "blue", "position": 9,  "stand": "ahead",
+     "Type": "Воин", "Урон": 30, "Здоровье": 80,  "иммунитет": [], "Тип атаки 1": "Weapon", "Тип атаки 2": ""},
+    # Тыл BLUE — два earth-лучника (один из них с 1000 HP), плюс обычный Weapon-лучник
+    {"имя": "Лучник",   "инициатива": 60, "инициатива_база": 60, "team": "blue", "position": 10, "stand": "behind",
+     "Type": "Archer","Урон": 20, "Здоровье": 150, "иммунитет": [], "Тип атаки 1": "earth", "Тип атаки 2": ""},
+    {"имя": "Лучник3",  "инициатива": 47, "инициатива_база": 47, "team": "blue", "position": 11, "stand": "behind",
+     "Type": "Archer","Урон": 20, "Здоровье": 60,   "иммунитет": [], "Тип атаки 1": "earth", "Тип атаки 2": ""},
+    {"имя": "Лучник2",  "инициатива": 75, "инициатива_база": 75, "team": "blue", "position": 12, "stand": "behind",
+     "Type": "Archer","Урон": 20, "Здоровье": 60,   "иммунитет": [], "Тип атаки 1": "Weapon","Тип атаки 2": ""},
+]
+
+# Диапазоны позиций
+RED_POSITIONS:  List[int] = list(range(1, 7))
+BLUE_POSITIONS: List[int] = list(range(7, 13))
+
+# Максимумы HP по типам — используется как базовый максимум для шкал (визуализация),
+# но для каждого юнита берём max(типовой_макс, стартовый HP), чтобы корректно отобразить 1000 HP у лучника BLUE.
+HP_MAX_BY_TYPE = {
+    "Archer": 60,
+    "Death": 60,
+    "Mage": 70,
+    "Воин": 80,
+    "Demon": 80,
+    "lord": 80,
+}
+
+# Константы для нормирования наблюдений
+MAX_HP   = max([u["Здоровье"] for u in (UNITS_RED + UNITS_BLUE)])   # 1000
+MAX_INIT = max([u["инициатива_база"] for u in (UNITS_RED + UNITS_BLUE)])
+MAX_DMG  = max([u["Урон"] for u in (UNITS_RED + UNITS_BLUE)])
+
+POISON_DAMAGE = 10
+POISON_TURNS  = 3
+
+BURN_DAMAGE = 10
+BURN_TURNS  = 3
+
+# ------------------------ Кастомная среда ------------------------
+class BattleEnv(gym.Env):
+    """
+    Среда RED vs BLUE для RL.
+
+    Наблюдение (obs): вектор (12 юнитов × 27 признаков = 324):
+      Для КАЖДОГО слота (в порядке pos=1..12) добавляются 27 чисел:
+        1)  HP               ∈ [0, MAX_HP]
+        2)  INI              ∈ [0, MAX_INIT]
+        3)  INI_base         ∈ [0, MAX_INIT]
+        4)  DMG              ∈ [0, MAX_DMG]
+        5)  team             ∈ {0(red),1(blue)}
+        6)  pos              ∈ [1,12]
+        7)  stand            ∈ {0(ahead),1(behind)}
+        8-13)  one-hot TYPE  ∈ {Archer,Mage,Воин,Demon,Death,lord} (6 dim)
+        14-17) иммунитет multi-hot по ATTACK_TYPES (Weapon,earth,Fire,poison) (4 dim)
+        18-21) Тип атаки 1 one-hot по ATTACK_TYPES                     (4 dim)
+        22-25) Тип атаки 2 one-hot по ATTACK_TYPES (все нули = пусто)  (4 dim)
+        26) poison_turns_left ∈ [0, POISON_TURNS]
+        27) burn_turns_left   ∈ [0, BURN_TURNS]
+
+    Действие (action): Discrete(6) — выбрать цель среди RED позиций 1..6.
+
+    Иммунитеты/эффекты:
+      • Урон блокируется, если Тип атаки 1 атакующего ∈ иммунитет цели.
+      • Наложение статусов (яд/поджог) блокируется, если Тип атаки 2 атакующего (если не пуст) ∈ иммунитет цели.
+    """
+
+    metadata = {"render_modes": []}
+
+    def __init__(self,
+                 reward_win: float = 1.0,
+                 reward_loss: float = -1.0,
+                 reward_step: float = 0.0,
+                 penalty_invalid_target: float = -0.10,       # удар по мёртвому/пустому слоту
+                 penalty_unreachable_warrior: float = -0.20,  # воин/демон/лорд: цель недоступна по правилам
+                 log_enabled: bool = False):
+        super().__init__()
+        self.reward_win  = float(reward_win)
+        self.reward_loss = float(reward_loss)
+        self.reward_step = float(reward_step)
+
+        # Штрафы
+        self.penalty_invalid_target = float(penalty_invalid_target)
+        self.penalty_unreachable_warrior = float(penalty_unreachable_warrior)
+
+        self.log_enabled = bool(log_enabled)
+        self._pretty_events: List[str] = []
+
+        # Пространство действий
+        self.action_space = spaces.Discrete(6)
+
+        # Пространство наблюдений: 27 признаков × 12 слотов
+        low_unit = np.array(
+            [0, 0, 0, 0, 0, 1, 0]                                   # HP, INI, INI_base, DMG, team, pos, stand
+            + [0]*len(TYPE_LIST)                                     # type one-hot
+            + [0]*len(ATTACK_TYPES)                                  # immunity multi-hot
+            + [0]*len(ATTACK_TYPES)                                  # attack1 one-hot
+            + [0]*len(ATTACK_TYPES)                                  # attack2 one-hot
+            + [0, 0],                                                # poison_left, burn_left
+            dtype=np.float32
+        )
+        high_unit = np.array(
+            [MAX_HP, MAX_INIT, MAX_INIT, MAX_DMG, 1, 12, 1]
+            + [1]*len(TYPE_LIST)
+            + [1]*len(ATTACK_TYPES)
+            + [1]*len(ATTACK_TYPES)
+            + [1]*len(ATTACK_TYPES)
+            + [POISON_TURNS, BURN_TURNS],
+            dtype=np.float32
+        )
+        low  = np.tile(low_unit, 12)
+        high = np.tile(high_unit, 12)
+        self.observation_space = spaces.Box(low=low, high=high, dtype=np.float32)
+
+        # Состояние боя
+        self.rng = random.Random()
+        self.combined: List[Dict] = []
+        self.round_no: int = 1
+        self.winner: Optional[str] = None
+        self.current_blue_attacker_pos: Optional[int] = None
+        self.blue_attacks_left: int = 0  # остаток ударов у текущего BLUE (демон = 2)
+        self._lord_applied_burn: Dict[int, bool] = {}  # pos -> True после ПЕРВОЙ успешной атаки лорда
+
+    # ------------------ Вспомогательные методы ------------------
+
+    def seed(self, seed=None):
+        self.rng = random.Random(seed)
+
+    def _alive(self, u) -> bool:
+        return u["Здоровье"] > 0
+
+    def _team_alive(self, team: str) -> bool:
+        return any(self._alive(u) and u["team"] == team for u in self.combined)
+
+    def _unit_by_position(self, pos: int):
+        return next((u for u in self.combined if u["position"] == pos), None)
+
+    def _live_positions_of(self, team: str):
+        return [u["position"] for u in self.combined if u["team"] == team and self._alive(u)]
+
+    def _log(self, s: str):
+        if self.log_enabled:
+            self._pretty_events.append(s)
+
+    def pop_pretty_events(self) -> List[str]:
+        out = self._pretty_events[:]
+        self._pretty_events.clear()
+        return out
+
+    def _col_of(self, pos: int) -> int:
+        """Колонка 0/1/2 (лев/центр/прав) по номеру позиции."""
+        return (pos - 1) % 3
+
+    def _enemy_rows(self, team: str):
+        """(ahead_positions, behind_positions) противника в порядке колонок 0..2."""
+        if team == "red":
+            return [7, 8, 9], [10, 11, 12]
+        else:
+            return [1, 2, 3], [4, 5, 6]
+
+    def _warrior_near_far_cols(self, col: int):
+        """Какие колонки смежные и дальняя для воина по его колонке."""
+        if col == 0:   # левый
+            return [0, 1], [2]
+        if col == 1:   # центр
+            return [0, 1, 2], []
+        return [1, 2], [0]  # правый
+
+    def _warrior_allowed_targets(self, attacker: Dict) -> List[int]:
+        """
+        Вернуть позиции, по которым Воин/Demon/lord МОЖЕТ ударить сейчас.
+        - В тылу не атакует, пока жив любой союзный Воин/Demon/lord во фронте.
+        - Во фронт врага сначала бьёт смежных; «дальний» доступен, когда оба смежных мертвы.
+        - Если фронт врага выбит — правила применяются к тылу врага.
+        """
+        assert attacker.get("Type") in ("Воин", "Demon", "lord")
+        # В тылу — ждём, пока фронтовые свои воины живы
+        if attacker["stand"] == "behind":
+            if any(self._alive(u) and u["team"] == attacker["team"]
+                   and u.get("Type") in ("Воин", "Demon", "lord") and u["stand"] == "ahead"
+                   for u in self.combined):
+                return []
+
+        ahead, behind = self._enemy_rows(attacker["team"])
+        col = self._col_of(attacker["position"])
+        near_cols, far_cols = self._warrior_near_far_cols(col)
+
+        def alive(pos):
+            uu = self._unit_by_position(pos)
+            return uu is not None and self._alive(uu)
+
+        # Сначала фронт
+        near = [ahead[c] for c in near_cols if alive(ahead[c])]
+        if near:
+            return near
+        far = [ahead[c] for c in far_cols if alive(ahead[c])]
+        if far:
+            return far
+
+        # Если фронт выбит — тыл
+        near2 = [behind[c] for c in near_cols if alive(behind[c])]
+        if near2:
+            return near2
+        far2 = [behind[c] for c in far_cols if alive(behind[c])]
+        return far2
+
+    # ----------- эффекты начала хода (яд/поджог) -----------
+    def _apply_start_of_turn_effects(self, unit: Dict) -> bool:
+        """Возвращает True, если юнит жив после применения эффектов."""
+        # ЯД
+        if unit.get("poison_turns_left", 0) > 0 and self._alive(unit):
+            before = unit["Здоровье"]
+            unit["Здоровье"] -= POISON_DAMAGE
+            unit["poison_turns_left"] -= 1
+            after = unit["Здоровье"]
+            self._log(f"☠ Яд поражает {unit['team'].upper()} {unit['имя']}#{unit['position']}: "
+                      f"{POISON_DAMAGE} ({before}→{max(0, after)}); осталось ходов: {unit['poison_turns_left']}")
+            if unit["Здоровье"] <= 0:
+                unit["инициатива"] = 0
+                self._log(f"✖ {unit['team'].upper()} {unit['имя']}#{unit['position']} погибает от яда.")
+                self._check_victory_after_hit()
+                return False
+
+        # ПОДЖОГ
+        if unit.get("burn_turns_left", 0) > 0 and self._alive(unit):
+            before = unit["Здоровье"]
+            unit["Здоровье"] -= BURN_DAMAGE
+            unit["burn_turns_left"] -= 1
+            after = unit["Здоровье"]
+            self._log(f"🔥 Поджог поражает {unit['team'].upper()} {unit['имя']}#{unit['position']}: "
+                      f"{BURN_DAMAGE} ({before}→{max(0, after)}); осталось ходов: {unit['burn_turns_left']}")
+            if unit["Здоровье"] <= 0:
+                unit["инициатива"] = 0
+                self._log(f"✖ {unit['team'].upper()} {unit['имя']}#{unit['position']} погибает от поджога.")
+                self._check_victory_after_hit()
+                return False
+
+        return True
+
+    # ------------------ Боевая логика ------------------
+
+    def _reset_state(self):
+        self.combined = [u.copy() for u in (UNITS_RED + UNITS_BLUE)]
+        for u in self.combined:
+            u["инициатива"] = u.get("инициатива_база", 0)
+            u.setdefault("Тип атаки 1", "Weapon")
+            u.setdefault("Тип атаки 2", "")
+            u.setdefault("иммунитет", [])
+            u["poison_turns_left"] = 0
+            u["burn_turns_left"] = 0
+        self.round_no = 1
+        self.winner = None
+        self.current_blue_attacker_pos = None
+        self.blue_attacks_left = 0
+        self._lord_applied_burn = {}
+        self._log(f"Эпизод начат. Раунд {self.round_no}.")
+
+    def _candidates(self):
+        return [u for u in self.combined if self._alive(u) and u["инициатива"] > 0]
+
+    def _pop_next(self):
+        cand = self._candidates()
+        if not cand:
+            return None
+        self.rng.shuffle(cand)
+        cand.sort(key=itemgetter("инициатива"), reverse=True)
+        return cand[0]
+
+    def _end_round_restore(self):
+        for u in self.combined:
+            u["инициатива"] = u.get("инициатива_база", 0) if self._alive(u) else 0
+        self._log("Восстановление инициативы. Новый раунд.")
+
+    # --- иммунитеты ---
+    def _is_immune_damage(self, attacker: Dict, victim: Dict) -> bool:
+        """Иммунитет к УРОНУ: сверяем 'Тип атаки 1' атакующего с 'иммунитет' цели."""
+        atk1 = attacker.get("Тип атаки 1", "Weapon")
+        return atk1 in (victim.get("иммунитет") or [])
+
+    def _is_immune_status(self, attacker: Dict, victim: Dict) -> bool:
+        """Иммунитет к НАЛОЖЕНИЮ статуса: сверяем 'Тип атаки 2' атакующего с 'иммунитет' цели."""
+        atk2 = attacker.get("Тип атаки 2", "")
+        return bool(atk2) and (atk2 in (victim.get("иммунитет") or []))
+
+    def _attack(self, attacker, target_pos: Optional[int]):
+        """
+        Выполнить урон.
+        Возврат: (hit: bool, reason: str)
+          reason ∈ {"ok","dead_or_absent","aoe","aoe_no_targets","immune_damage","immune_status"}
+        """
+        # AoE для Mage (поддержка на будущее)
+        if attacker is not None and attacker.get("Type") == "Mage":
+            enemy_team = "blue" if attacker["team"] == "red" else "red"
+            targets = [u for u in self.combined if u["team"] == enemy_team and self._alive(u)]
+            if targets:
+                self._log(f"{attacker['team'].upper()} {attacker['имя']}#{attacker['position']} (Mage) применяет массовую атаку.")
+                for victim in targets:
+                    if self._is_immune_damage(attacker, victim):
+                        self._log(f"🛡 Иммунитет к урону '{attacker.get('Тип атаки 1','')}' — "
+                                  f"{victim['team'].upper()} {victim['имя']}#{victim['position']}: урон 0.")
+                        continue
+                    before = victim["Здоровье"]
+                    victim["Здоровье"] -= attacker["Урон"]
+                    after = victim["Здоровье"]
+                    self._log(f"{attacker['team'].upper()} {attacker['имя']}#{attacker['position']} → "
+                              f"{victim['team'].upper()} {victim['имя']}#{victim['position']}: {attacker['Урон']} "
+                              f"({before}→{max(0, after)})")
+                    if victim["Здоровье"] <= 0:
+                        victim["инициатива"] = 0
+                        self._log(f"✖ {victim['team'].upper()} {victim['имя']}#{victim['position']} выведен из строя.")
+                return True, "aoe"
+            else:
+                self._log(f"{attacker['team'].upper()} {attacker['имя']}#{attacker['position']} (Mage) применяет массовую атаку: целей нет.")
+                return False, "aoe_no_targets"
+
+        # Обычная одиночная атака (Archer/Воин/Demon/Death/lord)
+        victim = self._unit_by_position(target_pos) if target_pos is not None else None
+        if victim is not None and self._alive(victim):
+            # иммунитет к урону (по Тип атаки 1)
+            if self._is_immune_damage(attacker, victim):
+                self._log(f"🛡 Иммунитет к урону '{attacker.get('Тип атаки 1','')}' — "
+                          f"{victim['team'].upper()} {victim['имя']}#{victim['position']}: атака наносит 0.")
+                return True, "immune_damage"
+
+            before = victim["Здоровье"]
+            victim["Здоровье"] -= attacker["Урон"]
+            after = victim["Здоровье"]
+            self._log(f"{attacker['team'].upper()} {attacker['имя']}#{attacker['position']} → "
+                      f"{victim['team'].upper()} {victim['имя']}#{victim['position']}: {attacker['Урон']} "
+                      f"({before}→{max(0, after)})")
+
+            # Наложение статусов (только если цель жива и нет иммунитета к Тип атаки 2)
+            if self._alive(victim):
+                # Death: яд (первое попадание по цели)
+                if attacker.get("Type") == "Death" and victim.get("poison_turns_left", 0) <= 0:
+                    if self._is_immune_status(attacker, victim):
+                        self._log(f"🛡 Иммунитет к эффекту '{attacker.get('Тип атаки 2','')}' — яд НЕ накладывается "
+                                  f"на {victim['team'].upper()} {victim['имя']}#{victim['position']}.")
+                    else:
+                        victim["poison_turns_left"] = POISON_TURNS
+                        self._log(f"☠ {attacker['team'].upper()} {attacker['имя']}#{attacker['position']} накладывает яд на "
+                                  f"{victim['team'].upper()} {victim['имя']}#{victim['position']} на {POISON_TURNS} хода.")
+
+                # lord: поджог (первая успешная атака от конкретного лорда)
+                if attacker.get("Type") == "lord":
+                    pos = attacker["position"]
+                    if not self._lord_applied_burn.get(pos, False):
+                        if self._is_immune_status(attacker, victim):
+                            self._log(f"🛡 Иммунитет к эффекту '{attacker.get('Тип атаки 2','')}' — поджог НЕ накладывается "
+                                      f"на {victim['team'].upper()} {victim['имя']}#{victim['position']}.")
+                        else:
+                            victim["burn_turns_left"] = BURN_TURNS
+                            self._lord_applied_burn[pos] = True
+                            self._log(f"🔥 {attacker['team'].upper()} {attacker['имя']}#{pos} накладывает поджог на "
+                                      f"{victim['team'].upper()} {victim['имя']}#{victim['position']} на {BURN_TURNS} хода.")
+
+            if victim["Здоровье"] <= 0:
+                victim["инициатива"] = 0
+                self._log(f"✖ {victim['team'].upper()} {victim['имя']}#{victim['position']} выведен из строя.")
+            return True, "ok"
+        else:
+            self._log(f"{attacker['team'].upper()} {attacker['имя']}#{attacker['position']} бьёт pos{target_pos}: цели нет/мертва/недоступна.")
+            return False, "dead_or_absent"
+
+    def _check_victory_after_hit(self):
+        if not self._team_alive("blue"):
+            self.winner = "red";  self._log("🏆 Победа RED!")
+        elif not self._team_alive("red"):
+            self.winner = "blue"; self._log("🏆 Победа BLUE!")
+
+    def _advance_until_blue_turn(self) -> bool:
+        """
+        Автопрокрутка до следующего хода BLUE или завершения боя.
+        RED ходит сам: Archer/Death — случайно; Воин/Demon/lord — по смежности (Demon бьёт дважды).
+        """
+        while self._team_alive("red") and self._team_alive("blue"):
+            nxt = self._pop_next()
+            if nxt is None:
+                self._log(f"— Конец раунда {self.round_no}.")
+                self._end_round_restore()
+                self.round_no += 1
+                self._log(f"— Начало раунда {self.round_no}.")
+                continue
+
+            # Эффекты начала хода (яд/поджог). Если умер — пропускаем действие.
+            if not self._apply_start_of_turn_effects(nxt):
+                if self.winner is not None:
+                    return False
+                continue
+
+            if nxt["team"] == "blue":
+                self.current_blue_attacker_pos = nxt["position"]
+                self.blue_attacks_left = 2 if (nxt.get("Type") == "Demon") else 1
+                self._log(
+                    f"Ход BLUE: {nxt['имя']}#{nxt['position']} (иниц {nxt['инициатива']}). "
+                    + ("Ожидание действия (демон: 2 удара)." if self.blue_attacks_left == 2 else "Ожидание действия.")
+                )
+                return True
+
+            # Ход RED (авто)
+            nxt["инициатива"] = 0
+            strikes = 2 if nxt.get("Type") == "Demon" else 1
+
+            for hit_i in range(strikes):
+                if self.winner is not None:
+                    return False
+
+                target_pos = None
+                if nxt.get("Type") in ("Воин", "Demon", "lord"):
+                    options = self._warrior_allowed_targets(nxt)
+                    if options:
+                        target_pos = self.rng.choice(options)
+                        prefix = nxt.get("Type")
+                        self._log(f"RED ход: {nxt['имя']}#{nxt['position']} ({prefix}) → цель pos{target_pos} (удар {hit_i+1}/{strikes}).")
+                    else:
+                        self._log(f"RED ход: {nxt['имя']}#{nxt['position']} ({nxt.get('Type')}) не может атаковать: доступных целей нет.")
+                elif nxt.get("Type") == "Mage":
+                    if hit_i == 0:
+                        self._log(f"RED ход: {nxt['имя']}#{nxt['position']} (Mage) выполняет массовую атаку.")
+                    else:
+                        break
+                else:
+                    # Archer / Death — случайная живая цель
+                    live_blue_positions = self._live_positions_of("blue")
+                    target_pos = self.rng.choice(live_blue_positions) if live_blue_positions else None
+                    ut = nxt.get("Type")
+                    self._log(f"RED ход: {nxt['имя']}#{nxt['position']} ({ut}) → случайная цель pos{target_pos} (удар {hit_i+1}/{strikes}).")
+
+                if target_pos is not None or nxt.get("Type") == "Mage":
+                    self._attack(nxt, target_pos)
+                    self._check_victory_after_hit()
+                    if self.winner is not None:
+                        return False
+        return False
+
+    # ------------------ Наблюдение для агента ------------------
+
+    def _obs(self) -> np.ndarray:
+        """
+        Построить наблюдение (12×27=324):
+        [HP, INI, INI_base, DMG, team, pos, stand,
+         TYPE(6), IMM(4), ATK1(4), ATK2(4), poison_left, burn_left] × 12
+        """
+        vec = []
+        for pos in RED_POSITIONS + BLUE_POSITIONS:
+            u = self._unit_by_position(pos)
+            hp      = float(max(0, u["Здоровье"]))
+            ini     = float(max(0, u["инициатива"]))
+            ini_b   = float(u.get("инициатива_база", 0))
+            dmg     = float(u["Урон"])
+            team_v  = 0.0 if u["team"] == "red" else 1.0
+            pos_v   = float(u["position"])
+            stand_v = 0.0 if u["stand"] == "ahead" else 1.0
+
+            t_onehot   = _one_hot(u.get("Type","Archer"), TYPE_LIST)
+            imm_mhot   = _multi_hot(u.get("иммунитет", []), ATTACK_TYPES)
+            atk1_oh    = _one_hot(u.get("Тип атаки 1",""), ATTACK_TYPES) if u.get("Тип атаки 1","") in ATTACK_TYPES else [0.0]*len(ATTACK_TYPES)
+            atk2_oh    = _one_hot(u.get("Тип атаки 2",""), ATTACK_TYPES) if u.get("Тип атаки 2","") in ATTACK_TYPES else [0.0]*len(ATTACK_TYPES)
+            poison_v   = float(u.get("poison_turns_left", 0))
+            burn_v     = float(u.get("burn_turns_left", 0))
+
+            vec.extend([hp, ini, ini_b, dmg, team_v, pos_v, stand_v, *t_onehot, *imm_mhot, *atk1_oh, *atk2_oh, poison_v, burn_v])
+        return np.array(vec, dtype=np.float32)
+
+    # ------------------ API Gymnasium ------------------
+
+    def reset(self, *, seed=None, options=None):
+        if seed is not None:
+            self.seed(seed)
+        self._reset_state()
+        self._advance_until_blue_turn()
+        return self._obs(), {}
+
+    def step(self, action):
+        assert self.winner is None, "Эпизод завершён — вызовите reset()."
+
+        # Докрутка до BLUE, если внезапно не его очередь
+        if self.current_blue_attacker_pos is None:
+            self._advance_until_blue_turn()
+            if self.winner is not None:
+                base = self.reward_win if self.winner == "blue" else self.reward_loss
+                return self._obs(), base, True, False, {}
+
+        # НАКОПИТЕЛЬ ШТРАФОВ ЗА ДЕЙСТВИЕ
+        step_shaping = 0.0
+
+        # Ход BLUE (возможно, это 1-й или 2-й удар демона)
+        target_pos = RED_POSITIONS[int(action)]
+        attacker = self._unit_by_position(self.current_blue_attacker_pos)
+        if attacker is not None and self._alive(attacker) and attacker["инициатива"] > 0:
+            self._log(f"BLUE действие: {attacker['имя']}#{attacker['position']} → pos{target_pos}")
+            # Сбрасываем инициативу на первом ударе; второй удар демона выполнится без возврата хода
+            attacker["инициатива"] = 0
+
+            if attacker.get("Type") in ("Воин", "Demon", "lord"):
+                allowed = self._warrior_allowed_targets(attacker)
+                if target_pos not in allowed:
+                    # Штраф: воин/демон/лорд пытается ударить недоступную цель
+                    self._log(
+                        f"BLUE {attacker['имя']}#{attacker['position']} ({attacker.get('Type')}) не может достать pos{target_pos}. "
+                        f"Доступные цели: {(', '.join('pos'+str(p) for p in allowed)) if allowed else 'нет'}"
+                    )
+                    step_shaping += self.penalty_unreachable_warrior
+                else:
+                    hit, reason = self._attack(attacker, target_pos)
+                    if not hit and reason == "dead_or_absent":
+                        step_shaping += self.penalty_invalid_target
+                    self._check_victory_after_hit()
+            elif attacker.get("Type") == "Mage":
+                hit, reason = self._attack(attacker, target_pos)
+                self._check_victory_after_hit()
+            else:
+                # Archer / Death
+                hit, reason = self._attack(attacker, target_pos)
+                if not hit and reason == "dead_or_absent":
+                    step_shaping += self.penalty_invalid_target
+                self._check_victory_after_hit()
+
+        # Если бой не завершился — проверяем, остались ли удары у BLUE (для демона)
+        if self.winner is None:
+            if self.blue_attacks_left > 0:
+                self.blue_attacks_left -= 1
+            # Если у демона остался ещё один удар — НЕ передаём ход и ждём следующего action
+            if self.blue_attacks_left > 0:
+                reward, terminated = self.reward_step + step_shaping, False
+                return self._obs(), reward, terminated, False, {}
+            # Иначе — передаём ход дальше
+            self.current_blue_attacker_pos = None
+            self._advance_until_blue_turn()
+
+        # Награда и флаги завершения (добавляем shaping)
+        if self.winner is None:
+            base = self.reward_step
+            terminated = False
+        else:
+            base = self.reward_win if self.winner == "blue" else self.reward_loss
+            terminated = True
+
+        reward = base + step_shaping
+        return self._obs(), reward, terminated, False, {}
+
+# ============================================================
+# БЛОК 2: ОБУЧЕНИЕ PPO + W&B, ТЕСТ И ОПЦИОНАЛЬНАЯ ВИЗУАЛИЗАЦИЯ
+# ============================================================
+
+# (Колаб) Установим нужные пакеты: SB3 и W&B. Gymnasium уже стоит.
+!pip -q install "stable-baselines3[extra]" wandb
+
+import os
+import re
+import time
+import shutil
+import random
+import numpy as np
+import torch
+
+# Stable-Baselines3
+from stable_baselines3 import PPO
+from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.callbacks import CallbackList, EvalCallback
+
+# Weights & Biases
+import wandb
+from wandb.integration.sb3 import WandbCallback
+
+# -------------------- Параметры обучения и теста --------------------
+TOTAL_STEPS     = 1_000_000
+N_ENVS          = 8
+MODEL_SAVE_FREQ = 10_000
+EVAL_FREQ       = 10_000
+SEED            = 42
+
+VISUALIZE_TEST = True
+FRAME_DELAY    = 0.28
+
+# -------------------- Инициализация W&B --------------------
+# Перед первым запуском: wandb.login()
+run = wandb.init(
+    project="red-blue-battle",
+    name=f"ppo-{TOTAL_STEPS//1000}k-full-roster-full-obs",
+    config={
+        "algo": "PPO",
+        "total_timesteps": TOTAL_STEPS,
+        "n_envs": N_ENVS,
+        "n_steps": 1024,
+        "batch_size": 2048,
+        "gamma": 0.99,
+        "gae_lambda": 0.95,
+        "learning_rate": 3e-4,
+        "clip_range": 0.2,
+        "model_save_freq": MODEL_SAVE_FREQ,
+        "eval_freq": EVAL_FREQ,
+        "obs_dim": 12*27,
+        "types": TYPE_LIST,
+        "attack_types": ATTACK_TYPES,
+    },
+    sync_tensorboard=True,
+    save_code=True,
+)
+
+# -------------------- Фабрика сред --------------------
+def make_env():
+    return Monitor(BattleEnv(
+        reward_win=1.0, reward_loss=-1.0, reward_step=0.0,
+        log_enabled=False
+    ))
+
+vec_env  = make_vec_env(make_env, n_envs=N_ENVS, seed=SEED)
+eval_env = Monitor(BattleEnv(log_enabled=False))
+
+# -------------------- Настройка модели PPO --------------------
+model = PPO(
+    policy="MlpPolicy",
+    env=vec_env,
+    verbose=1,
+    n_steps=1024,
+    batch_size=2048,
+    gae_lambda=0.95,
+    gamma=0.99,
+    n_epochs=10,
+    learning_rate=3e-4,
+    clip_range=0.2,
+    ent_coef=0.0,
+    vf_coef=0.5,
+    seed=SEED,
+    tensorboard_log=f"./tb_logs/{run.id}",
+)
+
+# -------------------- Колбэки W&B и оценки --------------------
+wandb_cb = WandbCallback(
+    gradient_save_freq=10000,
+    model_save_path=f"./models/{run.id}",
+    model_save_freq=MODEL_SAVE_FREQ,
+    verbose=2,
+)
+eval_cb = EvalCallback(
+    eval_env,
+    best_model_save_path=f"./models/{run.id}/best",
+    log_path=f"./eval/{run.id}",
+    eval_freq=EVAL_FREQ,
+    n_eval_episodes=5,
+    deterministic=True,
+    render=False,
+)
+
+# -------------------- Обучение --------------------
+model.learn(total_timesteps=TOTAL_STEPS, callback=CallbackList([wandb_cb, eval_cb]))
+
+# Сохранить финальную модель
+model.save("ppo_blue_vs_red_full_roster_full_obs")
+run.finish()
+
+# -------------------- Тестовый прогон с логами --------------------
+print("\n=== ТЕСТОВЫЙ ПРОГОН С ЛОГАМИ ===")
+test_env = BattleEnv(log_enabled=True)
+obs, info = test_env.reset(seed=SEED + 123)
+
+all_logs = []
+all_logs += test_env.pop_pretty_events()
+
+done = False
+total_reward = 0.0
+step_i = 0
+while not done:
+    step_i += 1
+    action, _ = model.predict(obs, deterministic=True)
+    target_pos = RED_POSITIONS[int(action)]
+    chosen_line = f"[STEP {step_i}] Агент выбирает action={int(action)} → атака RED pos{target_pos}"
+    print("\n" + chosen_line)
+    all_logs.append(chosen_line)
+
+    obs, reward, terminated, truncated, info = test_env.step(action)
+    total_reward += reward
+    done = terminated or truncated
+
+    new_lines = test_env.pop_pretty_events()
+    all_logs += new_lines
+    for line in new_lines:
+        print(line)
+
+print("\n=== ЭПИЗОД ЗАВЕРШЁН ===")
+print("Победитель:", test_env.winner.upper(), "| Суммарная награда:", total_reward)
+
+# -------------------- Matplotlib-визуализация (реальные шкалы HP на основе стартовых значений) --------------------
+if VISUALIZE_TEST:
+    import matplotlib.pyplot as plt
+    from matplotlib import patches
+    from IPython.display import display
+    import re, time, math
+
+    VISUAL_SPEED_MULT = 8.0
+
+    RED_FRONT, RED_BACK   = [1,2,3],   [4,5,6]
+    BLUE_FRONT, BLUE_BACK = [7,8,9],   [10,11,12]
+    COL_X = {0: 0.18, 1: 0.50, 2: 0.82}
+    Y_BLUE_BACK, Y_BLUE_FRONT = 0.88, 0.70
+    Y_RED_FRONT,  Y_RED_BACK  = 0.30, 0.12
+    SLOT_W, SLOT_H = 0.28, 0.13
+    HP_H = 0.025
+
+    # состояние для отрисовки — персональный максимум = max(типовой, стартовый HP)
+    state = {}
+    def _suffix_by_type(t: str) -> str:
+        return {
+            "Mage": " (Mage)",
+            "Воин": " (воин)",
+            "Demon": " (Demon)",
+            "Death": " (Death)",
+            "Archer": " (лучник)",
+            "lord": " (Lord)",
+        }.get(t, f" ({t})")
+
+    for u in (UNITS_RED + UNITS_BLUE):
+        t = u.get("Type", "Archer")
+        per_type_max = HP_MAX_BY_TYPE.get(t, 60)
+        start_hp = float(u["Здоровье"])
+        state[u["position"]] = {
+            "team": u["team"],
+            "name": u["имя"] + _suffix_by_type(t),
+            "hp": start_hp,
+            "maxhp": max(per_type_max, start_hp),
+            "stand": u["stand"],
+            "type": t,
+        }
+
+    # регексы для парсинга логов
+    atk_re   = re.compile(r'^(RED|BLUE)\s+[^\s#]+#(\d+)\s+→\s+(RED|BLUE)\s+[^\s#]+#(\d+):\s+(\d+)\s+\((\d+)→(\d+)\)')
+    kill_re  = re.compile(r'^✖\s+(RED|BLUE)\s+[^\s#]+#(\d+)\s+выведен из строя\.')
+    vict_re  = re.compile(r'^🏆 Победа (RED|BLUE)!')
+    blue_turn_re    = re.compile(r'^Ход BLUE:\s+[^\s#]+#(\d+)')
+    red_turn_re     = re.compile(r'^RED ход:\s+[^\s#]+#(\d+)')
+    blue_action_re  = re.compile(r'^BLUE действие:\s+[^\s#]+#(\d+)\s+→\s+pos(\d+)')
+    red_target_re   = re.compile(r'^RED ход:\s+[^\s#]+#(\d+).+цель pos(\d+)')
+    mage_banner_re  = re.compile(r'^\w+\s+[^\s#]+#(\d+)\s+\(Mage\).+массов')
+    blue_cant_re    = re.compile(r'^BLUE\s+[^\s#]+#(\d+).+не может достать pos(\d+)')
+    poison_tick_re  = re.compile(r'^☠ Яд поражает (RED|BLUE)\s+[^\s#]+#(\d+):\s+(\d+)\s+\((\d+)→(\d+)\)')
+    burn_tick_re    = re.compile(r'^🔥 Поджог поражает (RED|BLUE)\s+[^\s#]+#(\d+):\s+(\d+)\s+\((\д+)→(\д+)\)')
+    burn_tick_re    = re.compile(r'^🔥 Поджог поражает (RED|BLUE)\s+[^\s#]+#(\d+):\s+(\d+)\s+\((\d+)→(\d+)\)')
+
+    # фигура (без мерцания)
+    fig, ax = plt.subplots(figsize=(12, 8))
+    plt.close(fig)
+    handle = display(fig, display_id=True)
+
+    # -------- утилиты --------
+    def pos_to_xy(pos: int):
+        col = (pos - 1) % 3
+        x = COL_X[col] - SLOT_W/2
+        if pos in BLUE_BACK:   y = Y_BLUE_BACK  - SLOT_H/2
+        elif pos in BLUE_FRONT:y = Y_BLUE_FRONT - SLOT_H/2
+        elif pos in RED_FRONT: y = Y_RED_FRONT  - SLOT_H/2
+        else:                  y = Y_RED_BACK   - SLOT_H/2
+        return x, y
+
+    def draw_unit(ax, pos):
+        u = state[pos]; x, y = pos_to_xy(pos)
+        base = (0.90, 0.30, 0.30) if u["team"] == "red" else (0.30, 0.45, 0.90)
+        ax.add_patch(patches.FancyBboxPatch((x, y), SLOT_W, SLOT_H,
+                                            boxstyle="round,pad=0.008,rounding_size=0.015",
+                                            linewidth=1.3, edgecolor="black", facecolor=base, alpha=0.18))
+        label = u["name"][:22]
+        ax.text(x + 0.012, y + SLOT_H*0.72, label,
+                fontsize=10, fontweight="bold", ha="left", va="center", color="black")
+
+        # HP-бар: НОРМАЛИЗУЕМ НА ПЕРСОНАЛЬНЫЙ МАКСИМУМ (учитывает 1000 HP)
+        hp_x, hp_y = x + 0.012, y + SLOT_H*0.20
+        ax.add_patch(patches.Rectangle((hp_x, hp_y), SLOT_W-0.024, HP_H, color=(0.85,0.85,0.85), lw=0))
+        frac = 0.0
+        if u["maxhp"] > 1e-9:
+            frac = max(0.0, min(1.0, u["hp"]/u["maxhp"]))
+        ax.add_patch(patches.Rectangle((hp_x, hp_y), (SLOT_W-0.024)*frac, HP_H, color=(0.10,0.70,0.20), lw=0))
+        ax.text(x + SLOT_W/2, hp_y + HP_H*2.2, f"{int(max(0,u['hp']))}/{int(u['maxhp'])} HP",
+                fontsize=9, ha="center", va="center", color="black")
+
+        ax.text(x + SLOT_W/2, y - 0.008, f"pos{pos}", fontsize=8, ha="center", va="top", color=(0.2,0.2,0.2))
+
+    def draw_board(banner:str=""):
+        ax.cla()
+        ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.axis("off")
+        ax.plot([0.02, 0.98], [0.50, 0.50], color=(0.6,0.6,0.6), lw=1.2, ls="--", alpha=0.7)
+        ax.text(0.01, 0.96, "BLUE (top)", color=(0.2,0.35,0.8), fontsize=12, fontweight="bold", ha="left")
+        ax.text(0.01, 0.04, "RED (bottom)", color=(0.8,0.25,0.25), fontsize=12, fontweight="bold", ha="left")
+        for pos in BLUE_BACK + BLUE_FRONT + RED_FRONT + RED_BACK:
+            draw_unit(ax, pos)
+        if banner:
+            ax.text(0.5, 0.52, banner[:120], fontsize=12, ha="center", va="bottom", color=(0.15,0.15,0.15))
+        fig.canvas.draw(); handle.update(fig)
+
+    draw_board("Начало боя")
+
+    for line in all_logs:
+        # обновление HP по событиям
+        m = atk_re.match(line)
+        if m:
+            vic_pos = int(m.group(4)); after = int(m.group(7))
+            if vic_pos in state: state[vic_pos]["hp"] = after
+            draw_board(line); time.sleep(FRAME_DELAY * VISUAL_SPEED_MULT); continue
+
+        m = poison_tick_re.match(line)
+        if m:
+            vic_pos = int(m.group(2)); after = int(m.group(5))
+            if vic_pos in state: state[vic_pos]["hp"] = after
+            draw_board(line); time.sleep((FRAME_DELAY * VISUAL_SPEED_MULT) / 1.2); continue
+
+        m = burn_tick_re.match(line)
+        if m:
+            vic_pos = int(m.group(2)); after = int(m.group(5))
+            if vic_pos in state: state[vic_pos]["hp"] = after
+            draw_board(line); time.sleep((FRAME_DELAY * VISUAL_SPEED_MULT) / 1.2); continue
+
+        draw_board(line); time.sleep((FRAME_DELAY * VISUAL_SPEED_MULT) / 1.2)
+
+    draw_board("Конец эпизода")
+    time.sleep(0.6 * VISUAL_SPEED_MULT)
